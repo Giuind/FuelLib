@@ -57,6 +57,8 @@ class fuel:
             self.fuelDataDecompDir = FUELDATA_DECOMP_DIR
 
         self.groupDecompFile = os.path.join(self.fuelDataDecompDir, f"{decompName}.csv")
+        # TODO: I'm not gonna need the composition, as it is passed by the GA
+        # but maybe no need to remove, just ignore it
         self.gcxgcFile = os.path.join(self.fuelDataGcDir, f"{name}_init.csv")
         self.gcmTableFile = os.path.join(GCMTABLE_DIR, "gcmTable.csv")
 
@@ -118,6 +120,28 @@ class fuel:
                 f"equal the number of compounds in {self.gcxgcFile}."
             )
 
+        # Read and store interaction matrix
+        self.aFile = os.path.join(self.solverInputDir, "a.csv")
+
+        # Read energy interaction coefficients matrix
+        self.aFile = os.path.join(GCMTABLE_DIR, "a.csv")
+        df_a = pd.read_csv(self.aFile, header=None)
+        self.a = df_a.to_numpy()
+
+        if self.a.ndim != 2 or self.a.shape[0] != self.a.shape[1]:
+            raise ValueError(
+                f"Invalid interaction matrix in {self.aFile}:\n"
+                f"Matrix must be square, but shape is {self.a.shape}."
+            )
+
+        if self.a.shape[0] != self.num_groups:
+            raise ValueError(
+                f"Inconsistent UNIFAC data:\n"
+                f"The number of functional groups in {self.groupDecompFile} "
+                f"({self.num_groups}) does not match the size of the interaction "
+                f"matrix in {self.aFile} ({self.a.shape[0]})."
+            )
+
         # Read and store GCM table properties
         df_table = pd.read_csv(self.gcmTableFile)
         df_table = df_table.drop(columns=["Units"])
@@ -138,11 +162,11 @@ class fuel:
             return row.iloc[:, 1:].to_numpy().flatten()
 
         # Table data for functional groups (num_compounds,)
-        Tck = get_row("tck")  # critical temperature (1)
+        Tck = get_row("tck")  # critical temperature (K)
         Pck = get_row("pck")  # critical pressure (bar)
         Vck = get_row("vck")  # critical volume (m^3/kmol)
-        Tbk = get_row("tbk")  # boiling temperature (1)
-        Tmk = get_row("tmk")  # melting point temperature (1)
+        Tbk = get_row("tbk")  # boiling temperature (K)
+        Tmk = get_row("tmk")  # melting point temperature (K)
         hfk = get_row("hfk")  # enthalpy of formation, (kJ/mol)
         gfk = get_row("gfk")  # Gibbs energy (kJ/mol)
         hvk = get_row("hvk")  # latent heat of vaporization (kJ/mol)
@@ -152,6 +176,8 @@ class fuel:
         cpbk = get_row("CpBk")  # specific heat values (J/mol/K)
         cpck = get_row("CpCk")  # specific heat values (J/mol/K)
         mwk = get_row("MW")  # molecular weights (g/mol)
+        Rk = get_row("Rk")   # group surface area parameters (1)
+        self.Qk = get_row("Qk")   # group volume contributions (1)
 
         # --- Compute critical properties at standard temp (num_compounds,)
         # Molecular weights
@@ -173,6 +199,7 @@ class fuel:
         self.Tb = 204.359 * np.log(np.matmul(self.Nij, Tbk))  # K
 
         # T_m (melting temperature)
+        # TODO: this is the one we might use to substitute the manually inserted values of the compounds (still not clear the mixture)
         self.Tm = 102.425 * np.log(np.matmul(self.Nij, Tmk))  # K
 
         # H_f (enthalpy of formation)
@@ -211,6 +238,12 @@ class fuel:
             1.0 / 3
         )  # Angstroms
         self.sigma *= 1e-10  # Convert from Angstroms to m
+
+        # Activity coefficients
+        self.r = np.matmul(self.Nij, Rk)
+        self.q = np.matmul(self.Nij, self.Qk)
+        
+
 
     # -------------------------------------------------------------------------
     # Member functions
@@ -796,6 +829,95 @@ class fuel:
             tc = tc[0]
         return tc
 
+    # TODO: better check the Yi it gets in input
+    def activity(self, Yi, T, comp_idx=None)
+                        
+        if comp_idx is None:
+            r = self.r
+            q = self.q
+        else:
+            r = self.r[comp_idx]
+            q = self.q[comp_idx]
+
+
+        z = 10.0
+        LVec = (z/2)*(r - q) - (r - 1)
+
+        #  ENERGY INTERACTION PARAMETER
+        Psi = np.exp(-self.a / T)
+        
+        # Calculate mole fractions for each species
+        xVec = self.Y2X(Yi)
+
+        # Theta and Phi vectors
+        thetaVec = xVec * q / np.dot(xVec, q)
+        phiVec   = xVec * r / np.dot(xVec, r)
+
+        gammaCVec = np.exp(
+            np.log(phiVec / xVec)
+            + (z / 2.0) * q * np.log(thetaVec / phiVec)
+            + LVec
+            - (phiVec / xVec) * np.dot(xVec, LVec)
+        )
+
+        # Replace NaNs (fully vaporized species) with 1
+        gammaCVec = np.nan_to_num(gammaCVec, nan=1.0)
+
+        # -----------------------------
+        # Residual part
+        # -----------------------------
+        # Group mole fractions
+        # TODO: double check XVec.shape == (num_groups,)
+        XVec = xVec @ self.Nij
+        XVec = XVec / np.sum(XVec)
+
+        # Theta for groups
+        Q = self.Qk  
+        ThetaVec = Q * XVec / np.dot(Q, XVec)
+
+        # Avoid division by zero
+        denom = ThetaVec @ Psi
+        divRes = np.divide(ThetaVec, denom, out=np.zeros_like(ThetaVec), where=denom != 0)
+
+        GammaVec = Q * (1 - np.log(denom) - divRes @ Psi.T)
+
+        # --------------------------------
+        # Isolated group gammas per comp
+        # --------------------------------
+        GammaIVec = np.zeros((self.num_compounds, self.num_groups))
+
+        for i in range(self.num_compounds):
+            XIVec = self.Nij[i, :] / np.sum(self.Nij[i, :])
+            ThetaIVec = Q * XIVec / np.dot(Q, XIVec)
+
+            denom_i = ThetaIVec @ Psi
+            divRes_i = np.divide(
+                ThetaIVec,
+                denom_i,
+                out=np.zeros_like(ThetaIVec),
+                where=denom_i != 0,
+            )
+
+            GammaIVec[i, :] = Q * (
+                1 - np.log(denom_i) - divRes_i @ Psi.T
+            )
+
+        # -----------------------------
+        # Residual activity coefficients
+        # -----------------------------
+        gammaRVec = np.zeros(self.num_compounds)
+
+        for i in range(self.num_compounds):
+            gammaRVec[i] = np.exp(
+                np.dot(self.Nij[i, :], GammaVec - GammaIVec[i, :])
+            )
+
+        # -----------------------------
+        # Total activity coefficient
+        # -----------------------------
+        return gammaCVec * gammaRVec
+
+
     # --- Mixture functions ---
     def mixture_density(self, Yi, T):
         """
@@ -885,6 +1007,7 @@ class fuel:
         p_sati = self.psat(T, correlation=correlation)
 
         # Mixture vapor pressure via Raoult's law
+        # TODO: activity coefficients implicitly assumed unity
         p_v = p_sati @ Xi
 
         return p_v
