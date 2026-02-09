@@ -121,7 +121,7 @@ class fuel:
             )
 
         # Read and store interaction matrix
-        self.aFile = os.path.join(self.solverInputDir, "a.csv")
+        self.aFile = os.path.join(GCMTABLE_DIR, "a.csv")
 
         # Read energy interaction coefficients matrix
         self.aFile = os.path.join(GCMTABLE_DIR, "a.csv")
@@ -830,7 +830,7 @@ class fuel:
         return tc
 
     # TODO: better check the Yi it gets in input
-    def activity(self, Yi, T, comp_idx=None)
+    def activity(self, Yi, T, comp_idx=None):
                         
         if comp_idx is None:
             r = self.r
@@ -853,6 +853,7 @@ class fuel:
         thetaVec = xVec * q / np.dot(xVec, q)
         phiVec   = xVec * r / np.dot(xVec, r)
 
+        # TODO: treat following divisions in log() as np.divide(numerator, arg_log, out=np.zeros_like(numerator), where=arg_log != 0)
         gammaCVec = np.exp(
             np.log(phiVec / xVec)
             + (z / 2.0) * q * np.log(thetaVec / phiVec)

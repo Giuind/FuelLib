@@ -22,3 +22,9 @@ p_sat_i = fuel.psat(T)
 p_sat_mix = fuel.mixture_vapor_pressure(fuel.Y_0, T)
 print(f"Saturated vapor pressure at {T} K: {p_sat_i} Pa")
 print(f"Mixture saturated vapor pressure at {T} K: {p_sat_mix:.2f} Pa")
+
+# Calculate the activity coefficient at 320 K and compare it with original GroupContribution
+fuel = fl.fuel("posf10325")
+T = 320  # K
+gamma = fuel.activity(fuel.Y_0, T)
+print(f"Activity at {T} K: {gamma}")
