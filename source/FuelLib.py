@@ -70,12 +70,14 @@ class fuel:
 
         # Read functional group data for mixture (num_compounds,num_groups)
         df_Nij = pd.read_csv(self.groupDecompFile)
+        df_Nij = df_Nij.set_index(df_Nij.columns[0])
+        missing = set(self.name) - set(df_Nij.index)
+        if missing:
+            raise ValueError(f"Missing species in refCompounds.csv: {missing}")
         if not only_compounds:
-            self.Nij = df_Nij.iloc[:, 1:].to_numpy()
+            self.Nij = df_Nij.to_numpy()
         else:
-            # only look-up selected compounds from refCompounds.csv
-            mask = df_Nij.iloc[:, 0].isin(self.name)
-            self.Nij = df_Nij.loc[mask, df_Nij.columns[1:]].to_numpy()
+            self.Nij = df_Nij.loc[self.name].to_numpy()
         self.num_compounds = self.Nij.shape[0]
         self.num_groups = self.Nij.shape[1]
 
@@ -139,9 +141,6 @@ class fuel:
                 f"equal the number of compounds in {self.gcxgcFile}."
             )
 
-        # Read and store interaction matrix
-        self.aFile = os.path.join(GCMTABLE_DIR, "a.csv")
-
         # Read energy interaction coefficients matrix
         self.aFile = os.path.join(GCMTABLE_DIR, "a.csv")
         df_a = pd.read_csv(self.aFile, header=None)
@@ -202,6 +201,7 @@ class fuel:
         # Molecular weights
         self.MW = np.matmul(self.Nij, mwk)  # g/mol
         self.MW *= 1e-3  # Convert to kg/mol
+        self.X_0 = self.Y2X(self.Y_0)
 
         # T_c (critical temperature)
         self.Tc = 181.128 * np.log(np.matmul(self.Nij, Tck))  # K
@@ -259,8 +259,31 @@ class fuel:
         self.sigma *= 1e-10  # Convert from Angstroms to m
 
         # Activity coefficients
-        self.r = np.matmul(self.Nij, Rk)
-        self.q = np.matmul(self.Nij, self.Qk)
+        r = np.matmul(self.Nij, Rk)
+        q = np.matmul(self.Nij, self.Qk)
+        z = 10.0
+        LVec = (z/2)*(r - q) - (r - 1)
+        # TODO: get xVec from Y
+        thetaVec = self.X_0 * q / np.dot(self.X_0, q)
+        phiVec   = self.X_0 * r / np.dot(self.X_0, r)
+        # TODO: treat following divisions in log() as np.divide(numerator, arg_log, out=np.zeros_like(numerator), where=arg_log != 0)
+        self.gammaCVec = np.exp(
+            np.log(phiVec / self.X_0)
+            + (z / 2.0) * q * np.log(thetaVec / phiVec)
+            + LVec
+            - (phiVec / self.X_0) * np.dot(self.X_0, LVec)
+        )
+        # Replace NaNs (fully vaporized species) with 1
+        self.gammaCVec = np.nan_to_num(self.gammaCVec, nan=1.0)
+        # -----------------------------
+        # Residual part
+        # -----------------------------
+        # Group mole fractions
+        # TODO: double check XVec.shape == (num_groups,)
+        XVec = self.X_0 @ self.Nij
+        XVec = XVec / np.sum(XVec)
+        self.ThetaVec = self.Qk * XVec / np.dot(self.Qk, XVec)
+
         
 
 
@@ -848,61 +871,16 @@ class fuel:
             tc = tc[0]
         return tc
 
-    def activity(self, Xi, T, comp_idx=None):
-        # TODO: all this comp_idx structure is thought to work on Xi/Yi arrays
-        # all these info (Yi, num_compounds,.. should be consistent and coming from GA)                
-        if comp_idx is None:
-            r = self.r
-            q = self.q
-        else:
-            r = self.r[comp_idx]
-            q = self.q[comp_idx]
-
-
-        z = 10.0
-        LVec = (z/2)*(r - q) - (r - 1)
+    def activity(self, T, comp_idx=None):
 
         #  ENERGY INTERACTION PARAMETER
         Psi = np.exp(-self.a / T)
-        
-        # Calculate mole fractions for each species
-        #if comp_idx is None:
-        xVec = Xi #self.Y2X(Yi)
-        #else:
-            #xVec = Xi[comp_idx]
-
-        # Theta and Phi vectors
-        thetaVec = xVec * q / np.dot(xVec, q)
-        phiVec   = xVec * r / np.dot(xVec, r)
-
-        # TODO: treat following divisions in log() as np.divide(numerator, arg_log, out=np.zeros_like(numerator), where=arg_log != 0)
-        gammaCVec = np.exp(
-            np.log(phiVec / xVec)
-            + (z / 2.0) * q * np.log(thetaVec / phiVec)
-            + LVec
-            - (phiVec / xVec) * np.dot(xVec, LVec)
-        )
-
-        # Replace NaNs (fully vaporized species) with 1
-        gammaCVec = np.nan_to_num(gammaCVec, nan=1.0)
-
-        # -----------------------------
-        # Residual part
-        # -----------------------------
-        # Group mole fractions
-        # TODO: double check XVec.shape == (num_groups,)
-        XVec = xVec @ self.Nij
-        XVec = XVec / np.sum(XVec)
-
-        # Theta for groups
-        Q = self.Qk  
-        ThetaVec = Q * XVec / np.dot(Q, XVec)
 
         # Avoid division by zero
-        denom = ThetaVec @ Psi
-        divRes = np.divide(ThetaVec, denom, out=np.zeros_like(ThetaVec), where=denom != 0)
+        denom = self.ThetaVec @ Psi
+        divRes = np.divide(self.ThetaVec, denom, out=np.zeros_like(self.ThetaVec), where=denom != 0)
 
-        GammaVec = Q * (1 - np.log(denom) - divRes @ Psi.T)
+        GammaVec = self.Qk * (1 - np.log(denom) - divRes @ Psi.T)
 
         # --------------------------------
         # Isolated group gammas per comp
@@ -911,7 +889,7 @@ class fuel:
 
         for i in range(self.num_compounds):
             XIVec = self.Nij[i, :] / np.sum(self.Nij[i, :])
-            ThetaIVec = Q * XIVec / np.dot(Q, XIVec)
+            ThetaIVec = self.Qk * XIVec / np.dot(self.Qk, XIVec)
 
             denom_i = ThetaIVec @ Psi
             divRes_i = np.divide(
@@ -921,7 +899,7 @@ class fuel:
                 where=denom_i != 0,
             )
 
-            GammaIVec[i, :] = Q * (
+            GammaIVec[i, :] = self.Qk * (
                 1 - np.log(denom_i) - divRes_i @ Psi.T
             )
 
@@ -939,12 +917,8 @@ class fuel:
         # -----------------------------
         # Total activity coefficient
         # -----------------------------
-        result = gammaCVec * gammaRVec
+        result = self.gammaCVec * gammaRVec
 
-        # TODO: if result is redefined everytime the func is called, is not gonna have more than 1 element each time
-        # --> at the second call from GA it will throw error
-        # Maybe not cause Im creating an array at each call but filling only one element of it --> which should be exactly the comp_idx one.
-        # Very unefficient but maybe working
         if comp_idx is not None:
             return result[comp_idx]
 
