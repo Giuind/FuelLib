@@ -10,6 +10,7 @@ if FUELLIB_DIR not in sys.path:
     sys.path.append(FUELLIB_DIR)
 from paths import *
 
+from typing import Optional
 
 class fuel:
     """
@@ -30,11 +31,11 @@ class fuel:
     # Boltzmann's constant J/K
     k_B = 1.380649e-23
 
-    def __init__(self, name, decompName=None, fuelDataDir=FUELDATA_DIR):
+    def __init__(self, name, decompName=None, fuelDataDir=FUELDATA_DIR, only_compounds=False, Y : Optional[np.ndarray] = None):
         """
         Initialize the fuel object and calculate GCM properties.
 
-        :param name: Name of the mixture as it appears in its gcData file.
+        :param name: Name of the mixture as it appears in its gcData file or list of compounds strings.
         :type name: str
         :param decompName: Name of the groupDecomposition file if different from name.
         :type decompName: str, optional
@@ -43,8 +44,10 @@ class fuel:
         """
 
         self.name = name
-        if decompName is None:
-            decompName = name
+        if  not only_compounds:
+            if decompName is None:
+                decompName = name
+
         if fuelDataDir != FUELDATA_DIR:
             self.fuelDataDir = fuelDataDir
             self.fuelDataGcDir = os.path.join(self.fuelDataDir, "gcData")
@@ -56,15 +59,23 @@ class fuel:
             self.fuelDataGcDir = FUELDATA_GC_DIR
             self.fuelDataDecompDir = FUELDATA_DECOMP_DIR
 
-        self.groupDecompFile = os.path.join(self.fuelDataDecompDir, f"{decompName}.csv")
-        # TODO: I'm not gonna need the composition, as it is passed by the GA
-        # but maybe no need to remove, just ignore it
-        self.gcxgcFile = os.path.join(self.fuelDataGcDir, f"{name}_init.csv")
+        if only_compounds:
+            self.groupDecompFile = os.path.join(self.fuelDataDecompDir, "refCompounds.csv")
+            # Composition is passed in input when only_compounds
+            self.gcxgcFile = None
+        else:
+            self.groupDecompFile = os.path.join(self.fuelDataDecompDir, f"{decompName}.csv")
+            self.gcxgcFile = os.path.join(self.fuelDataGcDir, f"{name}_init.csv")
         self.gcmTableFile = os.path.join(GCMTABLE_DIR, "gcmTable.csv")
 
         # Read functional group data for mixture (num_compounds,num_groups)
         df_Nij = pd.read_csv(self.groupDecompFile)
-        self.Nij = df_Nij.iloc[:, 1:].to_numpy()
+        if not only_compounds:
+            self.Nij = df_Nij.iloc[:, 1:].to_numpy()
+        else:
+            # only look-up selected compounds from refCompounds.csv
+            mask = df_Nij.iloc[:, 0].isin(self.name)
+            self.Nij = df_Nij.loc[mask, df_Nij.columns[1:]].to_numpy()
         self.num_compounds = self.Nij.shape[0]
         self.num_groups = self.Nij.shape[1]
 
@@ -91,20 +102,28 @@ class fuel:
             elif sum(self.Nij[i, olefins : olefins + num_olefins]) > 0:
                 self.fam[i] = 3
 
-        # Read initial liquid composition of mixture and normalize to get mass frac
-        df_gcxgc = pd.read_csv(self.gcxgcFile)
-        self.compounds = [
-            compound.strip() for compound in df_gcxgc["Compound"].to_list()
-        ]
-        if "PelePhysics Key" in df_gcxgc.columns:
-            self.pelephysics_keys = [
-                key.strip() for key in df_gcxgc["PelePhysics Key"].to_list()
+        if  not only_compounds:
+            # Read initial liquid composition of mixture and normalize to get mass frac
+            df_gcxgc = pd.read_csv(self.gcxgcFile)
+            self.compounds = [
+                compound.strip() for compound in df_gcxgc["Compound"].to_list()
             ]
+            if "PelePhysics Key" in df_gcxgc.columns:
+                self.pelephysics_keys = [
+                    key.strip() for key in df_gcxgc["PelePhysics Key"].to_list()
+                ]
+            else:
+                self.pelephysics_keys = None
+            self.Y_0 = df_gcxgc["Weight %"].to_numpy().flatten().astype(float)
+            self.Y_0 /= np.sum(self.Y_0)
         else:
+            self.compounds = name
             self.pelephysics_keys = None
+            self.Y_0 = Y
+            #self.Y_0 = np.zeros(self.num_compounds, dtype=float)
+            #for i in range(len(self.Y_0)):
+            #    self.Y_0[i] = Y[i]
 
-        self.Y_0 = df_gcxgc["Weight %"].to_numpy().flatten().astype(float)
-        self.Y_0 /= np.sum(self.Y_0)
 
         # Make sure mixture data is consistent:
         if self.num_groups < self.N_g1:
@@ -829,9 +848,9 @@ class fuel:
             tc = tc[0]
         return tc
 
-    # TODO: better check the Yi it gets in input
-    def activity(self, Yi, T, comp_idx=None):
-                        
+    def activity(self, Xi, T, comp_idx=None):
+        # TODO: all this comp_idx structure is thought to work on Xi/Yi arrays
+        # all these info (Yi, num_compounds,.. should be consistent and coming from GA)                
         if comp_idx is None:
             r = self.r
             q = self.q
@@ -847,7 +866,10 @@ class fuel:
         Psi = np.exp(-self.a / T)
         
         # Calculate mole fractions for each species
-        xVec = self.Y2X(Yi)
+        #if comp_idx is None:
+        xVec = Xi #self.Y2X(Yi)
+        #else:
+            #xVec = Xi[comp_idx]
 
         # Theta and Phi vectors
         thetaVec = xVec * q / np.dot(xVec, q)
@@ -906,6 +928,7 @@ class fuel:
         # -----------------------------
         # Residual activity coefficients
         # -----------------------------
+        # TODO: gammaCVec also has as many elements as num_compounds (inherited from Xi)
         gammaRVec = np.zeros(self.num_compounds)
 
         for i in range(self.num_compounds):
@@ -916,7 +939,16 @@ class fuel:
         # -----------------------------
         # Total activity coefficient
         # -----------------------------
-        return gammaCVec * gammaRVec
+        result = gammaCVec * gammaRVec
+
+        # TODO: if result is redefined everytime the func is called, is not gonna have more than 1 element each time
+        # --> at the second call from GA it will throw error
+        # Maybe not cause Im creating an array at each call but filling only one element of it --> which should be exactly the comp_idx one.
+        # Very unefficient but maybe working
+        if comp_idx is not None:
+            return result[comp_idx]
+
+        return result
 
 
     # --- Mixture functions ---
