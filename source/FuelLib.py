@@ -31,9 +31,9 @@ class fuel:
     # Boltzmann's constant J/K
     k_B = 1.380649e-23
 
-    def __init__(self, name, decompName=None, fuelDataDir=FUELDATA_DIR, only_compounds=False, Y : Optional[np.ndarray] = None):
+    def __init__(self, name=None, decompName=None, fuelDataDir=FUELDATA_DIR, only_compounds=False, keywords_dict={}):
         """
-        Initialize the fuel object and calculate GCM properties.
+        Initialize the fuel object and read tables.
 
         :param name: Name of the mixture as it appears in its gcData file or list of compounds strings.
         :type name: str
@@ -42,11 +42,12 @@ class fuel:
         :param fuelDataDir: Directory where the fuel data is stored.
         :type fuelDataDir: str, optional
         """
-
         self.name = name
         if  not only_compounds:
             if decompName is None:
                 decompName = name
+        else:
+            self.only_compounds = only_compounds
 
         if fuelDataDir != FUELDATA_DIR:
             self.fuelDataDir = fuelDataDir
@@ -69,15 +70,151 @@ class fuel:
         self.gcmTableFile = os.path.join(GCMTABLE_DIR, "gcmTable.csv")
 
         # Read functional group data for mixture (num_compounds,num_groups)
-        df_Nij = pd.read_csv(self.groupDecompFile)
-        df_Nij = df_Nij.set_index(df_Nij.columns[0])
-        missing = set(self.name) - set(df_Nij.index)
+        self.df_Nij = pd.read_csv(self.groupDecompFile)
+        self.df_Nij = self.df_Nij.set_index(self.df_Nij.columns[0])
+        # Only look-up occurrences of selected compounds from df_Nij
+        # At this point GC controbutons not looked up yet--> do not calc prop
+        self.lookup_occurrences(calc_properties=False)
+
+        # Read energy interaction coefficients matrix
+        self.keywords_dict = keywords_dict
+        if self.keywords_dict.get("activity_coeffs"):
+            self.aFile = os.path.join(GCMTABLE_DIR, "a.csv")
+            df_a = pd.read_csv(self.aFile, header=None)
+            self.a = df_a.to_numpy()
+
+            if self.a.ndim != 2 or self.a.shape[0] != self.a.shape[1]:
+                raise ValueError(
+                    f"Invalid interaction matrix in {self.aFile}:\n"
+                    f"Matrix must be square, but shape is {self.a.shape}."
+                )
+
+            if self.a.shape[0] != self.num_groups:
+                raise ValueError(
+                    f"Inconsistent UNIFAC data:\n"
+                    f"The number of functional groups in {self.groupDecompFile} "
+                    f"({self.num_groups}) does not match the size of the interaction "
+                    f"matrix in {self.aFile} ({self.a.shape[0]})."
+                )
+
+        # Read and store GCM table properties
+        df_table = pd.read_csv(self.gcmTableFile)
+        df_table = df_table.drop(columns=["Units"])
+
+        def get_row(property_name):
+            """
+            Get property row from GCM table.
+
+            :param property_name: Name of the property to retrieve.
+            :type property_name: str
+            :return: Property values for all functional groups.
+            :rtype: np.ndarray
+            :raises ValueError: If property not found in GCM table.
+            """
+            row = df_table[df_table["Property"] == property_name]
+            if row.empty:
+                raise ValueError(f"Property '{property_name}' not found in GCM table.")
+            return row.iloc[:, 1:].to_numpy().flatten()
+
+        # Table data for functional groups (num_compounds,)
+        self.mwk = get_row("MW")  # molecular weights (g/mol)
+        if self.keywords_dict.get("critical_temp"): 
+            self.Tck = get_row("tck")  # critical temperature (K)
+        if self.keywords_dict.get("critical_press"): 
+            self.Pck = get_row("pck")  # critical pressure (bar)
+        if self.keywords_dict.get("critical_vol"): 
+            self.Vck = get_row("vck")  # critical volume (m^3/kmol)
+        if self.keywords_dict.get("boiling_temp"): 
+            self.Tbk = get_row("tbk")  # boiling temperature (K)
+        if self.keywords_dict.get("melting_temp"): 
+            self.Tmk = get_row("tmk")  # melting point temperature (K)
+        if self.keywords_dict.get("formation_enth"): 
+            self.hfk = get_row("hfk")  # enthalpy of formation, (kJ/mol)
+        if self.keywords_dict.get("formation_gibbs"): 
+            self.gfk = get_row("gfk")  # Gibbs energy (kJ/mol)
+        if self.keywords_dict.get("latent_heat"): 
+            self.hvk = get_row("hvk")  # latent heat of vaporization (kJ/mol)
+        if self.keywords_dict.get("acentric_factor"): 
+            self.wk = get_row("wk")  # accentric factor (1)
+        if self.keywords_dict.get("liquid_vol"): 
+            self.Vmk = get_row("vmk")  # (molar liquid volume at 298 K) (m^3/kmol)
+        if self.keywords_dict.get("specific_heat"): 
+            self.cpak = get_row("CpAk")  # specific heat values (J/mol/K)
+            self.cpbk = get_row("CpBk")  # specific heat values (J/mol/K)
+            self.cpck = get_row("CpCk")  # specific heat values (J/mol/K)
+        if self.keywords_dict.get("activity_coeffs"):
+            self.Rk = get_row("Rk")   # group surface area parameters (1)
+            self.Qk = get_row("Qk")   # group volume contributions (1)
+        
+        # Calc properties based on look-up GC contributions
+        self.get_properties()
+
+
+    def get_properties(self):
+        """
+        Compute properties at std conditions (num_compounds,)
+        """
+
+        # Molecular weights
+        self.MW = np.matmul(self.Nij, self.mwk)  # g/mol
+        self.MW *= 1e-3  # Convert to kg/mol
+
+        if self.keywords_dict.get("critical_temp"): 
+            self.Tc = 181.128 * np.log(np.matmul(self.Nij, self.Tck))  # K
+        if self.keywords_dict.get("critical_press"): 
+            self.Pc = 1.3705 + (np.matmul(self.Nij, self.Pck) + 0.10022) ** (-2)  # bar
+            self.Pc *= 1e5  # Convert to Pa from bar
+        if self.keywords_dict.get("critical_vol"): 
+            self.Vc = -0.00435 + (np.matmul(self.Nij, self.Vck))  # m^3/kmol
+            self.Vc *= 1e-3  # Convert to m^3/mol
+        if self.keywords_dict.get("boiling_temp"): 
+            self.Tb = 204.359 * np.log(np.matmul(self.Nij, self.Tbk))  # K
+        if self.keywords_dict.get("melting_temp"): 
+            self.Tm = 102.425 * np.log(np.matmul(self.Nij, self.Tmk))  # K
+        if self.keywords_dict.get("formation_enth"): 
+            self.Hf = 10.835 + np.matmul(self.Nij, self.hfk)  # kJ/mol
+            self.Hf *= 1e3  # Convert to J/mol
+        if self.keywords_dict.get("formation_gibbs"): 
+            self.Gf = -14.828 + np.matmul(self.Nij, self.gfk)  # kJ/mol
+            self.Gf *= 1e3  # Convert to J/mol
+        if self.keywords_dict.get("latent_heat"): 
+            self.Hv_stp = 6.829 + (np.matmul(self.Nij, self.hvk))  # kJ/mol
+            self.Hv_stp *= 1e3  # Convert to J/mol
+            # L_v,stp (latent heat of vaporization at 298 K)
+            self.Lv_stp = self.Hv_stp / self.MW  # J/kg
+        if self.keywords_dict.get("acentric_factor"): 
+            self.omega = 0.4085 * np.log(np.matmul(self.Nij, self.wk) + 1.1507) ** (1.0 / 0.5050)
+        if self.keywords_dict.get("liquid_vol"): 
+            self.Vm_stp = 0.01211 + np.matmul(self.Nij, self.Vmk)  # m^3/kmol
+            self.Vm_stp *= 1e-3  # Convert to m^3/mol
+        if self.keywords_dict.get("specific_heat"): 
+            # C_p,stp (specific heat at 298 K)
+            self.Cp_stp = np.matmul(self.Nij, self.cpak) - 19.7779  # J/mol/K
+
+            # Temperature corrections for C_p
+            self.Cp_B = np.matmul(self.Nij, self.cpbk)
+            self.Cp_C = np.matmul(self.Nij, self.cpck)
+
+        required = ["critical_temp", "critical_press", "acentric_factor"]
+        if all(self.keywords_dict.get(key, False) for key in required):
+            # Lennard-Jones parameters for diffusion calculations (Tee et al. 1966)
+            self.epsilonByKB = (0.7915 + 0.1693 * self.omega) * self.Tc  # K
+            Pc_atm = self.Pc / 101325  # atm
+            self.sigma = (2.3551 - 0.0874 * self.omega) * (self.Tc / Pc_atm) ** (
+                1.0 / 3
+            )  # Angstroms
+            self.sigma *= 1e-10  # Convert from Angstroms to m
+
+
+        
+    def lookup_occurrences(self, calc_properties=False):
+        missing = set(self.name) - set(self.df_Nij.index)
         if missing:
             raise ValueError(f"Missing species in refCompounds.csv: {missing}")
-        if not only_compounds:
-            self.Nij = df_Nij.to_numpy()
+        if not self.only_compounds:
+            self.Nij = self.df_Nij.to_numpy()
         else:
-            self.Nij = df_Nij.loc[self.name].to_numpy()
+            self.Nij = self.df_Nij.loc[self.name].to_numpy()
         self.num_compounds = self.Nij.shape[0]
         self.num_groups = self.Nij.shape[1]
 
@@ -104,7 +241,21 @@ class fuel:
             elif sum(self.Nij[i, olefins : olefins + num_olefins]) > 0:
                 self.fam[i] = 3
 
-        if  not only_compounds:
+        # recaclulate properties due to Nij update
+        if calc_properties:
+            self.get_properties()
+
+
+    def set_composition(self, compounds, Y : Optional[np.ndarray] = None):
+        """
+        Calculate GCM properties
+        """
+        # Only look-up occurrences of selected compounds from df_Nij
+        self.name = compounds
+        # Anytime set_composition is called, Nij might be updated. We need to update properties then
+        self.lookup_occurrences(calc_properties=True)
+
+        if  not self.only_compounds:
             # Read initial liquid composition of mixture and normalize to get mass frac
             df_gcxgc = pd.read_csv(self.gcxgcFile)
             self.compounds = [
@@ -119,7 +270,7 @@ class fuel:
             self.Y_0 = df_gcxgc["Weight %"].to_numpy().flatten().astype(float)
             self.Y_0 /= np.sum(self.Y_0)
         else:
-            self.compounds = name
+            self.compounds = self.name
             self.pelephysics_keys = None
             self.Y_0 = Y
             #self.Y_0 = np.zeros(self.num_compounds, dtype=float)
@@ -141,137 +292,27 @@ class fuel:
                 f"equal the number of compounds in {self.gcxgcFile}."
             )
 
-        # Read energy interaction coefficients matrix
-        self.aFile = os.path.join(GCMTABLE_DIR, "a.csv")
-        df_a = pd.read_csv(self.aFile, header=None)
-        self.a = df_a.to_numpy()
-
-        if self.a.ndim != 2 or self.a.shape[0] != self.a.shape[1]:
-            raise ValueError(
-                f"Invalid interaction matrix in {self.aFile}:\n"
-                f"Matrix must be square, but shape is {self.a.shape}."
-            )
-
-        if self.a.shape[0] != self.num_groups:
-            raise ValueError(
-                f"Inconsistent UNIFAC data:\n"
-                f"The number of functional groups in {self.groupDecompFile} "
-                f"({self.num_groups}) does not match the size of the interaction "
-                f"matrix in {self.aFile} ({self.a.shape[0]})."
-            )
-
-        # Read and store GCM table properties
-        df_table = pd.read_csv(self.gcmTableFile)
-        df_table = df_table.drop(columns=["Units"])
-
-        def get_row(property_name):
-            """
-            Get property row from GCM table.
-
-            :param property_name: Name of the property to retrieve.
-            :type property_name: str
-            :return: Property values for all functional groups.
-            :rtype: np.ndarray
-            :raises ValueError: If property not found in GCM table.
-            """
-            row = df_table[df_table["Property"] == property_name]
-            if row.empty:
-                raise ValueError(f"Property '{property_name}' not found in GCM table.")
-            return row.iloc[:, 1:].to_numpy().flatten()
-
-        # Table data for functional groups (num_compounds,)
-        Tck = get_row("tck")  # critical temperature (K)
-        Pck = get_row("pck")  # critical pressure (bar)
-        Vck = get_row("vck")  # critical volume (m^3/kmol)
-        Tbk = get_row("tbk")  # boiling temperature (K)
-        Tmk = get_row("tmk")  # melting point temperature (K)
-        hfk = get_row("hfk")  # enthalpy of formation, (kJ/mol)
-        gfk = get_row("gfk")  # Gibbs energy (kJ/mol)
-        hvk = get_row("hvk")  # latent heat of vaporization (kJ/mol)
-        wk = get_row("wk")  # accentric factor (1)
-        Vmk = get_row("vmk")  # liquid molar volume fraction (m^3/kmol)
-        cpak = get_row("CpAk")  # specific heat values (J/mol/K)
-        cpbk = get_row("CpBk")  # specific heat values (J/mol/K)
-        cpck = get_row("CpCk")  # specific heat values (J/mol/K)
-        mwk = get_row("MW")  # molecular weights (g/mol)
-        Rk = get_row("Rk")   # group surface area parameters (1)
-        self.Qk = get_row("Qk")   # group volume contributions (1)
-
-        # --- Compute critical properties at standard temp (num_compounds,)
-        # Molecular weights
-        self.MW = np.matmul(self.Nij, mwk)  # g/mol
-        self.MW *= 1e-3  # Convert to kg/mol
         self.X_0 = self.Y2X(self.Y_0)
+        # TODO: this must be calc/called only once (everytime Nij changes!)
+        if self.keywords_dict.get("activity_coeffs"):
+            self.initialize_activity_coefficients(self.X_0)
 
-        # T_c (critical temperature)
-        self.Tc = 181.128 * np.log(np.matmul(self.Nij, Tck))  # K
 
-        # p_c (critical pressure)
-        self.Pc = 1.3705 + (np.matmul(self.Nij, Pck) + 0.10022) ** (-2)  # bar
-        self.Pc *= 1e5  # Convert to Pa from bar
-
-        # V_c (critical volume)
-        self.Vc = -0.00435 + (np.matmul(self.Nij, Vck))  # m^3/kmol
-        self.Vc *= 1e-3  # Convert to m^3/mol
-
-        # T_b (boiling temperature)
-        self.Tb = 204.359 * np.log(np.matmul(self.Nij, Tbk))  # K
-
-        # T_m (melting temperature)
-        # TODO: this is the one we might use to substitute the manually inserted values of the compounds (still not clear the mixture)
-        self.Tm = 102.425 * np.log(np.matmul(self.Nij, Tmk))  # K
-
-        # H_f (enthalpy of formation)
-        self.Hf = 10.835 + np.matmul(self.Nij, hfk)  # kJ/mol
-        self.Hf *= 1e3  # Convert to J/mol
-
-        # G_f (Gibbs free energy)
-        self.Gf = -14.828 + np.matmul(self.Nij, gfk)  # kJ/mol
-        self.Gf *= 1e3  # Convert to J/mol
-
-        # H_v,stp (enthalpy of vaporization at 298 K)
-        self.Hv_stp = 6.829 + (np.matmul(self.Nij, hvk))  # kJ/mol
-        self.Hv_stp *= 1e3  # Convert to J/mol
-
-        # omega (accentric factor)
-        self.omega = 0.4085 * np.log(np.matmul(self.Nij, wk) + 1.1507) ** (1.0 / 0.5050)
-
-        # V_m (molar liquid volume at 298 K)
-        self.Vm_stp = 0.01211 + np.matmul(self.Nij, Vmk)  # m^3/kmol
-        self.Vm_stp *= 1e-3  # Convert to m^3/mol
-
-        # C_p,stp (specific heat at 298 K)
-        self.Cp_stp = np.matmul(self.Nij, cpak) - 19.7779  # J/mol/K
-
-        # Temperature corrections for C_p
-        self.Cp_B = np.matmul(self.Nij, cpbk)
-        self.Cp_C = np.matmul(self.Nij, cpck)
-
-        # L_v,stp (latent heat of vaporization at 298 K)
-        self.Lv_stp = self.Hv_stp / self.MW  # J/kg
-
-        # Lennard-Jones parameters for diffusion calculations (Tee et al. 1966)
-        self.epsilonByKB = (0.7915 + 0.1693 * self.omega) * self.Tc  # K
-        Pc_atm = self.Pc / 101325  # atm
-        self.sigma = (2.3551 - 0.0874 * self.omega) * (self.Tc / Pc_atm) ** (
-            1.0 / 3
-        )  # Angstroms
-        self.sigma *= 1e-10  # Convert from Angstroms to m
+    def initialize_activity_coefficients(self, X : Optional[np.ndarray] = None):
 
         # Activity coefficients
-        r = np.matmul(self.Nij, Rk)
+        r = np.matmul(self.Nij, self.Rk)
         q = np.matmul(self.Nij, self.Qk)
         z = 10.0
         LVec = (z/2)*(r - q) - (r - 1)
-        # TODO: get xVec from Y
-        thetaVec = self.X_0 * q / np.dot(self.X_0, q)
-        phiVec   = self.X_0 * r / np.dot(self.X_0, r)
+        thetaVec = X * q / np.dot(X, q)
+        phiVec   = X * r / np.dot(X, r)
         # TODO: treat following divisions in log() as np.divide(numerator, arg_log, out=np.zeros_like(numerator), where=arg_log != 0)
         self.gammaCVec = np.exp(
-            np.log(phiVec / self.X_0)
+            np.log(phiVec / X)
             + (z / 2.0) * q * np.log(thetaVec / phiVec)
             + LVec
-            - (phiVec / self.X_0) * np.dot(self.X_0, LVec)
+            - (phiVec / X) * np.dot(X, LVec)
         )
         # Replace NaNs (fully vaporized species) with 1
         self.gammaCVec = np.nan_to_num(self.gammaCVec, nan=1.0)
@@ -280,7 +321,7 @@ class fuel:
         # -----------------------------
         # Group mole fractions
         # TODO: double check XVec.shape == (num_groups,)
-        XVec = self.X_0 @ self.Nij
+        XVec = X @ self.Nij
         XVec = XVec / np.sum(XVec)
         self.ThetaVec = self.Qk * XVec / np.dot(self.Qk, XVec)
 
